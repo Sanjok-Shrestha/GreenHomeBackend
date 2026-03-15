@@ -1,25 +1,32 @@
 const jwt = require("jsonwebtoken");
+const User = require("../models/User"); // adjust path if needed
 
-exports.protect = (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
+const JWT_SECRET = process.env.JWT_SECRET || "SECRET_KEY";
 
-  if (!token)
-    return res.status(401).json({ message: "Not authorized" });
+exports.protect = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+
+  if (!token) return res.status(401).json({ message: "Not authorized" });
 
   try {
-    const decoded = jwt.verify(token, "SECRET_KEY");
-    req.user = decoded;
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded.id || decoded._id || decoded.sub;
+    if (!userId) return res.status(401).json({ message: "Invalid token payload" });
+
+    const user = await User.findById(userId).select("-password");
+    if (!user) return res.status(401).json({ message: "User not found" });
+
+    req.user = user;
     next();
   } catch (error) {
-    res.status(401).json({ message: "Invalid token" });
+    console.error("Auth protect error:", error);
+    return res.status(401).json({ message: "Invalid token" });
   }
 };
 
-exports.authorize = (...roles) => {
-  return (req, res, next) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ message: "Access denied" });
-    }
-    next();
-  };
+exports.authorize = (...roles) => (req, res, next) => {
+  if (!req.user) return res.status(401).json({ message: "Not authorized" });
+  if (!roles.includes(req.user.role)) return res.status(403).json({ message: "Access denied" });
+  next();
 };
