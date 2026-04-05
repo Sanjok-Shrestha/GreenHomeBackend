@@ -1,6 +1,13 @@
+// controllers/wasteController.js
 const mongoose = require("mongoose");
 const WastePost = require("../models/WastePost");
 const User = require("../models/User");
+const Pickup = (function tryRequirePickup() {
+  try { return require("../models/Pickup"); } catch (e) { try { return require("../src/models/Pickup"); } catch (e2) { return null; } }
+})();
+const Pricing = (function tryRequirePricing() {
+  try { return require("../models/Pricing"); } catch (e) { try { return require("../src/models/Pricing"); } catch (e2) { return null; } }
+})();
 
 // Helper to push a history entry
 function pushHistory(doc, status, userId, note) {
@@ -13,8 +20,35 @@ function pushHistory(doc, status, userId, note) {
   });
 }
 
+// small helper to escape regex special chars
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * DEBUG: List all pickups for the current collector (any status)
+ * GET /api/waste/collector/all-mine
+ */
+exports.debugListAllMyPickups = async (req, res) => {
+  try {
+    const collectorId = req.user?.id || req.user?._id;
+    if (!collectorId) return res.status(401).json({ message: "Not authorized" });
+
+    const items = await require("../models/WastePost").find({ collector: collectorId })
+      .sort({ createdAt: -1 })
+      .populate("user", "name email phone address")
+      .lean();
+
+    return res.json({ count: items.length, data: items });
+  } catch (err) {
+    console.error("debugListAllMyPickups error", err);
+    return res.status(500).json({ message: "Failed to fetch pickups" });
+  }
+};
+
 /**
  * Create Waste Post
+ * - snapshots pricePerKg and price (total) from Pricing collection when possible
  */
 exports.createWastePost = async (req, res) => {
   try {
@@ -31,18 +65,32 @@ exports.createWastePost = async (req, res) => {
       return res.status(400).json({ message: "wasteType and a valid quantity are required" });
     }
 
-    const type = String(wasteType).toLowerCase();
+    const type = String(wasteType).trim();
 
-    const PRICE_PER_KG = {
-      plastic: 40,
-      paper: 15,
-      metal: 80,
-      glass: 10,
-      organic: 5,
-      electronic: 200,
-    };
+    // Attempt to look up live pricing from Pricing collection (case-insensitive)
+    let pricePerKg = null;
+    try {
+      if (Pricing) {
+        const p = await Pricing.findOne({ wasteType: new RegExp("^" + escapeRegex(type) + "$", "i") }).lean();
+        if (p && typeof p.pricePerKg === "number") pricePerKg = Number(p.pricePerKg);
+      }
+    } catch (err) {
+      console.warn("Pricing lookup failed:", err && (err.message || err));
+    }
 
-    const pricePerKg = PRICE_PER_KG[type] ?? 20;
+    // Fallback to legacy map if no pricing document found
+    if (pricePerKg === null) {
+      const PRICE_PER_KG = {
+        plastic: 40,
+        paper: 15,
+        metal: 80,
+        glass: 10,
+        organic: 5,
+        electronic: 200,
+      };
+      pricePerKg = PRICE_PER_KG[type.toLowerCase()] ?? 20;
+    }
+
     const totalPrice = Math.round(pricePerKg * qty);
 
     const imageUrl = req.file ? `/uploads/${req.file.filename}` : undefined;
@@ -52,6 +100,7 @@ exports.createWastePost = async (req, res) => {
       wasteType: type,
       quantity: qty,
       price: totalPrice,
+      pricePerKg,               // snapshot per-kg price used at creation
       location: location ?? "",
       description: description ?? "",
       imageUrl,
@@ -82,6 +131,7 @@ exports.schedulePickup = async (req, res) => {
 
     waste.pickupDate = pickupDate;
     waste.status = "Scheduled";
+    pushHistory(waste, "Scheduled", req.user.id, "User scheduled pickup");
     await waste.save();
 
     res.json({ message: "Pickup Scheduled", waste });
@@ -190,6 +240,34 @@ exports.updateStatus = async (req, res) => {
       } catch (err) {
         console.error("Failed to award points:", err);
       }
+
+      // --- SYNC TO PICKUP COLLECTION ---
+      // Upsert Pickup document for this completed WastePost
+      try {
+        await Pickup.findOneAndUpdate(
+          { user: waste.user, collector: waste.collector, wasteType: waste.wasteType, description: waste.description },
+          {
+            wasteType: waste.wasteType,
+            quantity: waste.quantity,
+            price: waste.price,
+            pricePerKg: waste.pricePerKg,
+            status: status,
+            user: waste.user,
+            collector: waste.collector,
+            location: waste.location,
+            address: waste.address,
+            imageUrl: waste.imageUrl,
+            description: waste.description,
+            pickedAt: waste.pickedAt,
+            completedAt: waste.completedAt,
+            history: waste.history,
+          },
+          { upsert: true, new: true }
+        );
+      } catch (syncErr) {
+        console.error("Failed to upsert Pickup on collect:", syncErr);
+      }
+      // --- END SYNC ---
     } else {
       pushHistory(waste, status, userId);
     }
@@ -208,7 +286,7 @@ exports.updateStatus = async (req, res) => {
 };
 
 /**
- * markAsCollected (keeps compatibility with existing route)
+ * markAsCollected (compatibility wrapper)
  */
 exports.markAsCollected = async (req, res) => {
   try {
@@ -257,6 +335,54 @@ exports.getCollectorEarnings = async (req, res) => {
   } catch (error) {
     console.error("getCollectorEarnings error:", error);
     res.status(500).json({ message: "Error calculating earnings" });
+  }
+};
+
+/**
+ * Get collector history — pickups completed/collected by this collector
+ */
+exports.getCollectorHistory = async (req, res) => {
+  try {
+    const collectorId = req.user?.id || req.user?._id;
+    if (!collectorId) return res.status(401).json({ message: "Not authorized" });
+
+    const { from, to } = req.query;
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10));
+    const pageSize = Math.min(500, Math.max(1, parseInt(String(req.query.pageSize || "100"), 10)));
+
+    // Case-insensitive matches for "collected" or "completed"
+    const statusOr = [{ status: /^collected$/i }, { status: /^completed$/i }];
+
+    const and = [{ collector: collectorId }, { $or: statusOr }];
+
+    // date filters on completedAt if provided
+    if (from || to) {
+      const completedAtFilter = {};
+      if (from) completedAtFilter.$gte = new Date(String(from));
+      if (to) completedAtFilter.$lte = new Date(String(to));
+      and.push({ completedAt: completedAtFilter });
+    }
+
+    const filter = { $and: and };
+
+    const total = await WastePost.countDocuments(filter);
+    const items = await WastePost.find(filter)
+      .sort({ completedAt: -1, updatedAt: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .populate("user", "name phone address")
+      .populate("collector", "name email")
+      .lean();
+
+    return res.json({
+      total,
+      page,
+      pageSize,
+      data: items,
+    });
+  } catch (err) {
+    console.error("getCollectorHistory error", err);
+    return res.status(500).json({ message: "Failed to fetch history" });
   }
 };
 
@@ -322,7 +448,7 @@ exports.assignPickup = async (req, res) => {
 
     return res.status(200).json({ message: "Assigned", data: updated });
   } catch (error) {
-    console.error("assignPickup error:", error);
+    console.error("assignPickup error", error);
     return res.status(500).json({ message: "Failed to assign pickup" });
   }
 };
