@@ -1,12 +1,16 @@
-// controllers/rewardController.js (safer require pattern)
+// controllers/rewardController.js (refactored to prefer utils/rewards as single source)
 const mongoose = require("mongoose");
 const { Types } = mongoose;
-const { REWARDS: COLLECTOR_REWARDS, findReward } = require("../utils/rewards");
 
 // tryRequire helper
 function tryRequire(p) {
   try { return require(p); } catch (e) { return null; }
 }
+
+// Prefer utils/rewards as the canonical reward source (safe require)
+const utilsRewards = tryRequire("../utils/rewards") || tryRequire("../../utils/rewards") || null;
+const COLLECTOR_REWARDS = Array.isArray(utilsRewards?.REWARDS) ? utilsRewards.REWARDS : [];
+const findReward = typeof utilsRewards?.findReward === "function" ? utilsRewards.findReward : null;
 
 // Load models with fallbacks to mongoose.models (so missing files do not throw)
 const Payment = tryRequire("../models/Payment") || mongoose.models?.Payment || null;
@@ -29,25 +33,24 @@ try {
   }
 } catch (e) { /* ignore */ }
 
-/* Server-side user/collector reward definitions (kept local) */
+/* Server-side user/collector reward definitions (user catalog kept local) */
 const USER_REWARDS = [
   { id: "v100", title: "Rs 100 Voucher", cost: 100, description: "Redeemable at partner stores" },
   { id: "pickup", title: "Free Pickup", cost: 200, description: "One free scheduled pickup" },
   { id: "discount", title: "5% Off", cost: 50, description: "Discount on next order" },
 ];
 
-const COLLECTOR_REWARDS_LOCAL = COLLECTOR_REWARDS || [
-  { id: "meal", title: "Free Meal", cost: 100, description: "Meal voucher for collectors" },
-  { id: "helmet", title: "Free Helmet", cost: 500, description: "Safety helmet (admin-approved)" },
-  { id: "voucher100", title: "₹100 Voucher", cost: 120, description: "Gift voucher worth ₹100" },
-];
-
 function findUserReward(id) {
   return USER_REWARDS.find((r) => String(r.id) === String(id));
 }
+
 function findCollectorReward(id) {
-  // prefer utils/rewards if available
-  return (typeof findReward === "function" && findReward(id)) || COLLECTOR_REWARDS_LOCAL.find((r) => String(r.id) === String(id));
+  // prefer utils/rewards.findReward if available
+  if (typeof findReward === "function") {
+    const r = findReward(id);
+    if (r) return r;
+  }
+  return COLLECTOR_REWARDS.find((r) => String(r.id) === String(id));
 }
 
 /* -------------------- Catalog -------------------- */
@@ -63,7 +66,7 @@ exports.getCatalog = async (req, res) => {
         pointsPerKg: POINTS_PER_KG_USER,
       },
     };
-    return res.json({ user: USER_REWARDS, collector: COLLECTOR_REWARDS_LOCAL, policy });
+    return res.json({ user: USER_REWARDS, collector: COLLECTOR_REWARDS, policy });
   } catch (err) {
     console.error("rewardController.getCatalog error:", err && (err.stack || err.message || err));
     return res.status(500).json({ message: "Failed to load catalog" });

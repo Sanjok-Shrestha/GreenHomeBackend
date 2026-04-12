@@ -1,7 +1,10 @@
-// controllers/wasteController.js
+// server/controllers/wasteController.js
+const path = require("path");
 const mongoose = require("mongoose");
 const WastePost = require("../models/WastePost");
-const User = require("../models/User");
+const User = (function tryUser() {
+  try { return require("../models/User"); } catch (e) { try { return require("../src/models/User"); } catch (e2) { return null; } }
+})();
 const Pickup = (function tryRequirePickup() {
   try { return require("../models/Pickup"); } catch (e) { try { return require("../src/models/Pickup"); } catch (e2) { return null; } }
 })();
@@ -9,20 +12,46 @@ const Pricing = (function tryRequirePricing() {
   try { return require("../models/Pricing"); } catch (e) { try { return require("../src/models/Pricing"); } catch (e2) { return null; } }
 })();
 
-// Helper to push a history entry
+const Notification = require("../models/Notification");
+const { notifyCollectorPlaceholder } = require("../utils/notify");
+
+// Helper to push history entry (safe)
 function pushHistory(doc, status, userId, note) {
   doc.history = doc.history || [];
-  doc.history.push({
+  const entry = {
     status,
-    by: userId ? new mongoose.Types.ObjectId(userId) : undefined,
     at: new Date(),
     note: note || "",
-  });
+  };
+  if (userId) {
+    try {
+      entry.by = new mongoose.Types.ObjectId(userId);
+    } catch (e) {
+      entry.by = userId;
+    }
+  }
+  doc.history.push(entry);
 }
 
-// small helper to escape regex special chars
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const FALLBACK_PRICE_PER_KG = {
+  plastic: 40,
+  paper: 15,
+  metal: 80,
+  glass: 10,
+  organic: 5,
+  electronic: 200,
+};
+
+// Socket/notification helpers (adapt to your app)
+function emitToAdmins(event, payload) {
+  try { if (global.io) global.io.to("admins").emit(event, payload); } catch (e) {}
+}
+function emitToUser(userId, event, payload) {
+  try { if (global.io && userId) global.io.to(`user:${String(userId)}`).emit(event, payload); } catch (e) {}
 }
 
 /**
@@ -34,7 +63,7 @@ exports.debugListAllMyPickups = async (req, res) => {
     const collectorId = req.user?.id || req.user?._id;
     if (!collectorId) return res.status(401).json({ message: "Not authorized" });
 
-    const items = await require("../models/WastePost").find({ collector: collectorId })
+    const items = await WastePost.find({ collector: collectorId })
       .sort({ createdAt: -1 })
       .populate("user", "name email phone address")
       .lean();
@@ -48,7 +77,6 @@ exports.debugListAllMyPickups = async (req, res) => {
 
 /**
  * Create Waste Post
- * - snapshots pricePerKg and price (total) from Pricing collection when possible
  */
 exports.createWastePost = async (req, res) => {
   try {
@@ -59,7 +87,7 @@ exports.createWastePost = async (req, res) => {
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ message: "Not authorized" });
 
-    const { wasteType, quantity, location, description } = req.body;
+    const { wasteType, quantity, location, description, lat, lng } = req.body;
     const qty = Number(quantity);
     if (!wasteType || Number.isNaN(qty) || qty <= 0) {
       return res.status(400).json({ message: "wasteType and a valid quantity are required" });
@@ -67,7 +95,7 @@ exports.createWastePost = async (req, res) => {
 
     const type = String(wasteType).trim();
 
-    // Attempt to look up live pricing from Pricing collection (case-insensitive)
+    // Attempt to look up live pricing (case-insensitive)
     let pricePerKg = null;
     try {
       if (Pricing) {
@@ -78,34 +106,51 @@ exports.createWastePost = async (req, res) => {
       console.warn("Pricing lookup failed:", err && (err.message || err));
     }
 
-    // Fallback to legacy map if no pricing document found
     if (pricePerKg === null) {
-      const PRICE_PER_KG = {
-        plastic: 40,
-        paper: 15,
-        metal: 80,
-        glass: 10,
-        organic: 5,
-        electronic: 200,
-      };
-      pricePerKg = PRICE_PER_KG[type.toLowerCase()] ?? 20;
+      pricePerKg = FALLBACK_PRICE_PER_KG[type.toLowerCase()] ?? 20;
     }
 
     const totalPrice = Math.round(pricePerKg * qty);
 
-    const imageUrl = req.file ? `/uploads/${req.file.filename}` : undefined;
+    const imageUrl = req.file ? `/api/uploads/${req.file.filename}` : undefined;
 
-    const waste = await WastePost.create({
+    const payload = {
       user: userId,
       wasteType: type,
       quantity: qty,
       price: totalPrice,
-      pricePerKg,               // snapshot per-kg price used at creation
+      pricePerKg,
       location: location ?? "",
+      address: location ?? "",
+      lat: lat ? Number(lat) : null,
+      lng: lng ? Number(lng) : null,
       description: description ?? "",
       imageUrl,
       status: "Pending",
-    });
+    };
+
+    const waste = await WastePost.create(payload);
+
+    // optional: notify collector pool about new available pickup (non-blocking)
+    try { notifyCollectorPlaceholder(waste); } catch (e) {}
+
+    // 🔔 Notification: user submitted waste
+    try {
+      await Notification.create({
+        user: userId,
+        title: "Waste submitted",
+        message: `Your ${waste.wasteType || "waste"} post has been created and is pending pickup.`,
+        type: "waste_submitted",
+        meta: {
+          wasteId: waste._id,
+          quantity: waste.quantity,
+          price: waste.price,
+          location: waste.location,
+        },
+      });
+    } catch (notifyErr) {
+      console.error("[notifications] createWastePost:", notifyErr && (notifyErr.stack || notifyErr.message));
+    }
 
     return res.status(201).json({
       success: true,
@@ -113,31 +158,88 @@ exports.createWastePost = async (req, res) => {
       waste,
     });
   } catch (error) {
-    console.error("createWastePost error:", error);
+    console.error("createWastePost error:", error && (error.stack || error.message || error));
     return res.status(500).json({ message: error.message || "Error creating waste post" });
   }
 };
 
 /**
  * Schedule Pickup (owner)
+ * Accepts body.pickupDate (ISO string)
  */
 exports.schedulePickup = async (req, res) => {
   try {
     const { pickupDate } = req.body;
+    if (!pickupDate) {
+      return res.status(400).json({ message: "pickupDate required" });
+    }
+
+    const d = new Date(pickupDate);
+    if (isNaN(d.getTime())) return res.status(400).json({ message: "Invalid pickupDate" });
+    if (d <= new Date()) return res.status(400).json({ message: "Pickup date must be in the future" });
+
+    const hour = d.getHours();
+    if (hour < 8 || hour >= 18) return res.status(400).json({ message: "Choose a time between 08:00 and 18:00" });
+
     const waste = await WastePost.findById(req.params.id);
     if (!waste) return res.status(404).json({ message: "Waste post not found" });
 
-    if (String(waste.user) !== String(req.user.id)) return res.status(403).json({ message: "Not authorized" });
+    if (String(waste.user) !== String(req.user.id) && req.user.role !== "admin") {
+      return res.status(403).json({ message: "Not authorized" });
+    }
 
-    waste.pickupDate = pickupDate;
+    waste.pickupDate = d.toISOString();
     waste.status = "Scheduled";
     pushHistory(waste, "Scheduled", req.user.id, "User scheduled pickup");
     await waste.save();
 
-    res.json({ message: "Pickup Scheduled", waste });
+    // 🔔 Notification: pickup scheduled
+    try {
+      await Notification.create({
+        user: waste.user,
+        title: "Pickup scheduled",
+        message: `Your pickup for ${waste.wasteType || "waste"} has been scheduled on ${d.toLocaleString()}.`,
+        type: "pickup_scheduled",
+        meta: {
+          wasteId: waste._id,
+          pickupDate: waste.pickupDate,
+        },
+      });
+    } catch (notifyErr) {
+      console.error("[notifications] schedulePickup:", notifyErr && (notifyErr.stack || notifyErr.message));
+    }
+
+    return res.json({ message: "Pickup Scheduled", waste });
   } catch (error) {
-    console.error("schedulePickup error:", error);
-    res.status(500).json({ message: "Error scheduling pickup" });
+    console.error("schedulePickup error:", error && (error.stack || error.message || error));
+    return res.status(500).json({ message: "Error scheduling pickup" });
+  }
+};
+
+/**
+ * cancelSchedule - clear pickupDate and set status back to Pending
+ */
+exports.cancelSchedule = async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ message: "id required" });
+
+    const waste = await WastePost.findById(id);
+    if (!waste) return res.status(404).json({ message: "Waste post not found" });
+
+    if (String(waste.user) !== String(req.user.id) && req.user.role !== "admin") {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+
+    waste.pickupDate = null;
+    waste.status = "Pending";
+    pushHistory(waste, "Cancelled", req.user.id, "User cancelled pickup");
+    await waste.save();
+
+    return res.json({ message: "Cancelled", waste });
+  } catch (err) {
+    console.error("cancelSchedule error", err && (err.stack || err.message || err));
+    return res.status(500).json({ message: "Error cancelling schedule" });
   }
 };
 
@@ -146,11 +248,11 @@ exports.schedulePickup = async (req, res) => {
  */
 exports.getUserWastePosts = async (req, res) => {
   try {
-    const wastes = await WastePost.find({ user: req.user.id }).sort({ createdAt: -1 });
-    res.json(wastes);
+    const wastes = await WastePost.find({ user: req.user.id }).sort({ createdAt: -1 }).lean();
+    return res.json(wastes);
   } catch (error) {
-    console.error("getUserWastePosts error:", error);
-    res.status(500).json({ message: "Error fetching waste posts" });
+    console.error("getUserWastePosts error:", error && (error.stack || error.message || error));
+    return res.status(500).json({ message: "Error fetching waste posts" });
   }
 };
 
@@ -161,7 +263,7 @@ exports.trackPickup = async (req, res) => {
   try {
     const waste = await WastePost.findById(req.params.id)
       .populate("collector", "name email role")
-      .populate("user", "name email phone address role");
+      .populate("user", "name email phone address");
 
     if (!waste) return res.status(404).json({ message: "Pickup not found" });
 
@@ -189,61 +291,121 @@ exports.trackPickup = async (req, res) => {
 
     return res.json(waste);
   } catch (error) {
-    console.error("trackPickup error:", error);
-    res.status(500).json({ message: "Error tracking pickup" });
+    console.error("trackPickup error:", error && (error.stack || error.message || error));
+    return res.status(500).json({ message: "Error tracking pickup" });
   }
 };
 
 /**
- * Generic status update handler
- * Supports PATCH /:id/status, PATCH /:id, POST /:id/status
+ * Generic status update handler (collector/admin)
+ *
+ * Role-aware:
+ * - collector marking 'Collected' => becomes 'CollectedPending' (no points)
+ * - admin marking 'Completed' => finalizes and awards points
  */
 exports.updateStatus = async (req, res) => {
   try {
     const id = req.params.id;
-    const { status } = req.body;
+    let { status, note } = req.body || {};
     const userId = req.user?.id || req.user?._id;
+    const role = (req.user?.role || "").toLowerCase();
 
     if (!status) return res.status(400).json({ message: "Missing status" });
 
     const waste = await WastePost.findById(id);
     if (!waste) return res.status(404).json({ message: "Waste not found" });
 
-    // guard: only assigned collector or admin can change status (if collector set)
-    if (waste.collector && String(waste.collector) !== String(userId) && req.user.role !== "admin") {
+    // Only assigned collector (or admin) can update assigned pickup
+    if (waste.collector && String(waste.collector) !== String(userId) && role !== "admin") {
       return res.status(403).json({ message: "Not allowed to update this pickup" });
     }
 
-    const s = String(status).toLowerCase();
-    waste.status = status;
+    const s = String(status).trim();
+    const lowered = s.toLowerCase();
 
-    if (!waste.collector && userId) {
+    // Role-aware handling
+    if (lowered === "picked") {
+      waste.status = "Picked";
+      waste.pickedAt = waste.pickedAt || new Date();
+      pushHistory(waste, "Picked", userId, note || "Marked picked by collector");
+    } else if (lowered === "collected") {
+      // If admin triggers 'collected', treat as final Completed.
+      if (role === "admin") {
+        waste.status = "Completed";
+        const now = new Date();
+        waste.completedAt = waste.completedAt || now;
+        waste.approvedAt = waste.approvedAt || now;
+        waste.approvedBy = waste.approvedBy || userId;
+        if (!waste.pickedAt) waste.pickedAt = now;
+        pushHistory(waste, "Completed", userId, note || "Admin marked completed");
+        // award points to collector (if present)
+        if (waste.collector) {
+          try {
+            if (User) {
+              const coll = await User.findById(waste.collector);
+              if (coll) {
+                const rewardPoints = Math.round((waste.quantity || 0) * (Number(process.env.POINTS_PER_KG ?? 10)));
+                coll.points = (coll.points || 0) + rewardPoints;
+                await coll.save();
+              }
+            }
+          } catch (e) {
+            console.error("award points error (admin final):", e && e.message);
+          }
+        }
+      } else {
+        // Collector marking collected -> set to CollectedPending (awaiting admin)
+        waste.status = "CollectedPending";
+        waste.collectedAt = waste.collectedAt || new Date();
+        if (!waste.collector && userId) waste.collector = userId;
+        pushHistory(waste, "CollectedPending", userId, note || "Collector marked collected (pending approval)");
+        // notify admins
+        emitToAdmins("pickup-awaiting-approval", { id: waste._id, status: waste.status });
+      }
+    } else if (lowered === "completed") {
+      // Admin finalizes completion (only allow admin)
+      if (role !== "admin") {
+        return res.status(403).json({ message: "Only admin can finalize completion" });
+      }
+      waste.status = "Completed";
+      const now = new Date();
+      waste.completedAt = waste.completedAt || now;
+      waste.approvedAt = waste.approvedAt || now;
+      waste.approvedBy = waste.approvedBy || userId;
+      if (!waste.pickedAt) waste.pickedAt = now;
+      pushHistory(waste, "Completed", userId, note || "Admin marked completed");
+
+      // award points to collector (background best)
+      if (waste.collector) {
+        try {
+          if (User) {
+            const coll = await User.findById(waste.collector);
+            if (coll) {
+              const rewardPoints = Math.round((waste.quantity || 0) * (Number(process.env.POINTS_PER_KG ?? 10)));
+              coll.points = (coll.points || 0) + rewardPoints;
+              await coll.save();
+            }
+          }
+        } catch (e) {
+          console.error("award points error (completed):", e && e.message);
+        }
+      }
+    } else {
+      // Generic other statuses
+      waste.status = s;
+      pushHistory(waste, s, userId, note || "Status updated");
+    }
+
+    // ensure collector assigned if updater is collector
+    if (!waste.collector && role === "collector" && userId) {
       waste.collector = userId;
     }
 
-    if (s === "picked") {
-      waste.pickedAt = waste.pickedAt || new Date();
-      pushHistory(waste, "Picked", userId, "Marked picked by collector");
-    } else if (s === "collected" || s === "completed") {
-      waste.completedAt = waste.completedAt || new Date();
-      if (!waste.pickedAt) waste.pickedAt = new Date();
-      pushHistory(waste, "Collected", userId, "Marked collected — job complete");
+    await waste.save();
 
-      // reward points to owner
-      try {
-        const owner = await User.findById(waste.user);
-        if (owner) {
-          const rewardPoints = Math.round((waste.quantity || 0) * 10);
-          owner.points = (owner.points || 0) + rewardPoints;
-          await owner.save();
-        }
-      } catch (err) {
-        console.error("Failed to award points:", err);
-      }
-
-      // --- SYNC TO PICKUP COLLECTION ---
-      // Upsert Pickup document for this completed WastePost
-      try {
+    // sync to Pickup collection if model exists and status is final-ish
+    try {
+      if (Pickup && (waste.status === "Completed" || waste.status === "CollectedPending" || waste.status === "Picked")) {
         await Pickup.findOneAndUpdate(
           { user: waste.user, collector: waste.collector, wasteType: waste.wasteType, description: waste.description },
           {
@@ -251,7 +413,7 @@ exports.updateStatus = async (req, res) => {
             quantity: waste.quantity,
             price: waste.price,
             pricePerKg: waste.pricePerKg,
-            status: status,
+            status: waste.status,
             user: waste.user,
             collector: waste.collector,
             location: waste.location,
@@ -264,15 +426,32 @@ exports.updateStatus = async (req, res) => {
           },
           { upsert: true, new: true }
         );
-      } catch (syncErr) {
-        console.error("Failed to upsert Pickup on collect:", syncErr);
       }
-      // --- END SYNC ---
-    } else {
-      pushHistory(waste, status, userId);
+    } catch (syncErr) {
+      console.error("Failed to upsert Pickup on status update:", syncErr && (syncErr.stack || syncErr.message || syncErr));
     }
 
-    await waste.save();
+    // notifications
+    try {
+      await Notification.create({
+        user: waste.user,
+        title: "Pickup status changed",
+        message: `Pickup ${waste._id} status changed to ${waste.status}.`,
+        type: "pickup_status_changed",
+        meta: { wasteId: waste._id, status: waste.status },
+      });
+      if (waste.collector) {
+        await Notification.create({
+          user: waste.collector,
+          title: "Pickup status changed",
+          message: `Pickup ${waste._id} status changed to ${waste.status}.`,
+          type: "pickup_status_changed_collector",
+          meta: { wasteId: waste._id, status: waste.status },
+        });
+      }
+    } catch (notifyErr) {
+      console.error("[notifications] updateStatus:", notifyErr && (notifyErr.stack || notifyErr.message));
+    }
 
     const populated = await WastePost.findById(waste._id)
       .populate("user", "name email phone address")
@@ -280,50 +459,67 @@ exports.updateStatus = async (req, res) => {
 
     return res.json({ ok: true, pickup: populated });
   } catch (err) {
-    console.error("updateStatus error", err);
+    console.error("updateStatus error", err && (err.stack || err.message || err));
     return res.status(500).json({ message: "Failed to update status" });
   }
 };
 
 /**
- * markAsCollected (compatibility wrapper)
+ * markAsCollected (compat wrapper)
+ *
+ * Collector -> sets CollectedPending
+ * Admin -> finalizes Completed
  */
 exports.markAsCollected = async (req, res) => {
   try {
+    const id = req.params.id;
+    const role = (req.user?.role || "").toLowerCase();
+
+    if (role === "admin") {
+      // admin finalizes completion
+      req.body = req.body || {};
+      req.body.status = "Completed";
+      return exports.updateStatus(req, res);
+    }
+
+    // collector path -> mark collected (pending approval)
     req.body = req.body || {};
+    // set to 'Collected' but updateStatus will convert to CollectedPending for collectors
     req.body.status = "Collected";
     return exports.updateStatus(req, res);
   } catch (err) {
-    console.error("markAsCollected error", err);
+    console.error("markAsCollected error", err && (err.stack || err.message || err));
     return res.status(500).json({ message: "Error completing pickup" });
   }
 };
 
 /**
- * Get assigned pickups for collector (not collected)
+ * Get assigned pickups for collector (not final/completed)
+ * Return items including CollectedPending so collector sees awaiting-approval
  */
 exports.getAssignedPickups = async (req, res) => {
   try {
     const pickups = await WastePost.find({
       collector: req.user.id,
-      status: { $ne: "Collected" },
+      // include CollectedPending and Picked, exclude final Completed
+      status: { $ne: "Completed" },
     }).populate("user", "name email phone address");
 
     res.json(pickups);
   } catch (error) {
-    console.error("getAssignedPickups error:", error);
+    console.error("getAssignedPickups error", error && (error.stack || error.message || error));
     res.status(500).json({ message: "Error fetching assigned pickups" });
   }
 };
 
 /**
- * Collector earnings (collected)
+ * Collector earnings (Completed only)
  */
 exports.getCollectorEarnings = async (req, res) => {
   try {
     const collected = await WastePost.find({
       collector: req.user.id,
-      status: "Collected",
+      status: "Completed",
     });
 
     const totalEarnings = collected.reduce((sum, waste) => sum + (waste.price || 0), 0);
@@ -333,13 +529,13 @@ exports.getCollectorEarnings = async (req, res) => {
       totalEarnings,
     });
   } catch (error) {
-    console.error("getCollectorEarnings error:", error);
-    res.status(500).json({ message: "Error calculating earnings" });
+    console.error("getCollectorEarnings error", error && (error.stack || error.message || error));
+    return res.status(500).json({ message: "Error calculating earnings" });
   }
 };
 
 /**
- * Get collector history — pickups completed/collected by this collector
+ * Get collector history — pickups completed/collected by this collector (Completed)
  */
 exports.getCollectorHistory = async (req, res) => {
   try {
@@ -350,12 +546,8 @@ exports.getCollectorHistory = async (req, res) => {
     const page = Math.max(1, parseInt(String(req.query.page || "1"), 10));
     const pageSize = Math.min(500, Math.max(1, parseInt(String(req.query.pageSize || "100"), 10)));
 
-    // Case-insensitive matches for "collected" or "completed"
-    const statusOr = [{ status: /^collected$/i }, { status: /^completed$/i }];
+    const and = [{ collector: collectorId }, { status: "Completed" }];
 
-    const and = [{ collector: collectorId }, { $or: statusOr }];
-
-    // date filters on completedAt if provided
     if (from || to) {
       const completedAtFilter = {};
       if (from) completedAtFilter.$gte = new Date(String(from));
@@ -381,7 +573,7 @@ exports.getCollectorHistory = async (req, res) => {
       data: items,
     });
   } catch (err) {
-    console.error("getCollectorHistory error", err);
+    console.error("getCollectorHistory error", err && (err.stack || err.message || err));
     return res.status(500).json({ message: "Failed to fetch history" });
   }
 };
@@ -395,7 +587,7 @@ exports.getAvailablePickups = async (req, res) => {
     const query = {
       $and: [
         { collector: null },
-        { status: { $nin: ["Collected", "Completed"] } },
+        { status: { $nin: ["CollectedPending", "Completed"] } },
       ],
     };
 
@@ -406,7 +598,7 @@ exports.getAvailablePickups = async (req, res) => {
 
     return res.status(200).json(items);
   } catch (error) {
-    console.error("getAvailablePickups error", error);
+    console.error("getAvailablePickups error", error && (error.stack || error.message || error));
     return res.status(500).json({ message: "Failed to load available pickups" });
   }
 };
@@ -422,7 +614,7 @@ exports.assignPickup = async (req, res) => {
 
     const updated = await WastePost.findOneAndUpdate(
       { _id: id, collector: null },
-      { collector: collectorId, status: "Scheduled" },
+      { collector: collectorId, status: "Picked", updatedAt: new Date() },
       { new: true }
     ).populate("user", "name phone address email");
 
@@ -437,18 +629,271 @@ exports.assignPickup = async (req, res) => {
       return res.status(400).json({ message: "Unable to assign pickup" });
     }
 
-    // push history entry for assignment
     try {
       const doc = await WastePost.findById(updated._id);
       pushHistory(doc, "Assigned", collectorId, "Collector assigned");
       await doc.save();
     } catch (err) {
-      console.error("Failed to push assign history:", err);
+      console.error("Failed to push assign history:", err && (err.stack || err.message || err));
+    }
+
+    // 🔔 Notifications after assignment
+    try {
+      await Notification.create({
+        user: updated.user._id,
+        title: "Collector assigned",
+        message: "A collector has been assigned to your pickup request.",
+        type: "collector_assigned",
+        meta: {
+          wasteId: updated._id,
+          collectorId: collectorId,
+        },
+      });
+
+      await Notification.create({
+        user: collectorId,
+        title: "Pickup assigned to you",
+        message: `You have been assigned a pickup for ${updated.wasteType || "waste"}.`,
+        type: "pickup_assigned",
+        meta: {
+          wasteId: updated._id,
+          userId: updated.user._id,
+        },
+      });
+    } catch (notifyErr) {
+      console.error("[notifications] assignPickup:", notifyErr && (notifyErr.stack || notifyErr.message));
     }
 
     return res.status(200).json({ message: "Assigned", data: updated });
   } catch (error) {
-    console.error("assignPickup error", error);
+    console.error("assignPickup error", error && (error.stack || error.message || error));
     return res.status(500).json({ message: "Failed to assign pickup" });
   }
 };
+
+/* -------------------------
+   Admin helpers: pending approvals, approve, reject
+   ------------------------- */
+
+/**
+ * GET /waste/admin/pending-approvals
+ * Returns pickups where collectors marked collected and are awaiting admin approval
+ */
+exports.getPendingApprovals = async (req, res) => {
+  try {
+    // Only admin should call this — route middleware should enforce, but double-check
+    if ((req.user?.role || "").toLowerCase() !== "admin") {
+      return res.status(403).json({ message: "Admin only" });
+    }
+
+    const items = await WastePost.find({ status: "CollectedPending" })
+      .sort({ collectedAt: -1, createdAt: -1 })
+      .populate("user", "name email phone address")
+      .populate("collector", "name email")
+      .lean();
+
+    return res.json({ data: items });
+  } catch (err) {
+    console.error("getPendingApprovals error", err && (err.stack || err.message || err));
+    return res.status(500).json({ message: "Failed to load pending approvals" });
+  }
+};
+
+/**
+ * POST /waste/:id/approve
+ * Admin approves a collected pickup and finalizes it to Completed.
+ * Awards points to collector (guarded by processedForPoints if model has it).
+ */
+exports.approveCompletion = async (req, res) => {
+  try {
+    if ((req.user?.role || "").toLowerCase() !== "admin") return res.status(403).json({ message: "Admin only" });
+    const id = req.params.id;
+
+    // Prefer model static if available
+    if (typeof WastePost.approveCompletion === "function") {
+      const updated = await WastePost.approveCompletion(id, req.user._id, req.body?.note || "Admin approved");
+      if (!updated) return res.status(404).json({ message: "Not found" });
+
+      // send notifications
+      try {
+        if (updated.user) {
+          await Notification.create({
+            user: updated.user,
+            title: "Pickup approved",
+            message: `Your pickup ${updated._id} was approved by admin.`,
+            type: "pickup_approved",
+            meta: { wasteId: updated._id },
+          });
+          emitToUser(updated.user, "notification", { title: "Pickup approved", targetId: updated._id });
+        }
+        if (updated.collector) {
+          await Notification.create({
+            user: updated.collector,
+            title: "Pickup approved",
+            message: `Pickup ${updated._id} has been approved and completed.`,
+            type: "pickup_approved_collector",
+            meta: { wasteId: updated._id },
+          });
+          emitToUser(updated.collector, "notification", { title: "Pickup approved", targetId: updated._id });
+        }
+        emitToAdmins("pickup-approved", { id: updated._id, status: updated.status });
+      } catch (notifyErr) {
+        console.error("[notifications] approveCompletion:", notifyErr && (notifyErr.stack || notifyErr.message));
+      }
+
+      return res.json({ data: updated });
+    }
+
+    // Fallback inline update if model static not present
+    const now = new Date();
+    const waste = await WastePost.findById(id);
+    if (!waste) return res.status(404).json({ message: "Not found" });
+
+    waste.status = "Completed";
+    waste.completedAt = waste.completedAt || now;
+    waste.approvedAt = waste.approvedAt || now;
+    waste.approvedBy = waste.approvedBy || req.user._id;
+    pushHistory(waste, "Completed", req.user._id, req.body?.note || "Admin approved completion");
+
+    // award points (guard processedForPoints if available)
+    try {
+      if (!waste.processedForPoints && waste.collector && User) {
+        const coll = await User.findById(waste.collector);
+        if (coll) {
+          const rewardPoints = Math.round((waste.quantity || 0) * (Number(process.env.POINTS_PER_KG ?? 10)));
+          coll.points = (coll.points || 0) + rewardPoints;
+          await coll.save();
+          waste.processedForPoints = true;
+        }
+      }
+    } catch (e) {
+      console.error("award points error (approve fallback):", e && e.message);
+    }
+
+    await waste.save();
+
+    // notifications
+    try {
+      if (waste.user) {
+        await Notification.create({
+          user: waste.user,
+          title: "Pickup approved",
+          message: `Your pickup ${waste._id} was approved by admin.`,
+          type: "pickup_approved",
+          meta: { wasteId: waste._id },
+        });
+        emitToUser(waste.user, "notification", { title: "Pickup approved", targetId: waste._id });
+      }
+      if (waste.collector) {
+        await Notification.create({
+          user: waste.collector,
+          title: "Pickup approved",
+          message: `Pickup ${waste._id} has been approved and completed.`,
+          type: "pickup_approved_collector",
+          meta: { wasteId: waste._id },
+        });
+        emitToUser(waste.collector, "notification", { title: "Pickup approved", targetId: waste._id });
+      }
+      emitToAdmins("pickup-approved", { id: waste._id, status: waste.status });
+    } catch (notifyErr) {
+      console.error("[notifications] approveCompletion fallback:", notifyErr && (notifyErr.stack || notifyErr.message));
+    }
+
+    const populated = await WastePost.findById(waste._id).populate("user", "name email phone address").populate("collector", "name email");
+    return res.json({ data: populated });
+  } catch (err) {
+    console.error("approveCompletion error", err && (err.stack || err.message || err));
+    return res.status(500).json({ message: "Server error" });
+  }
+};
+
+/**
+ * POST /waste/:id/reject
+ * Admin rejects a collected pickup -> reverts to Picked (or other chosen status) and saves reason
+ */
+exports.rejectCompletion = async (req, res) => {
+  try {
+    if ((req.user?.role || "").toLowerCase() !== "admin") return res.status(403).json({ message: "Admin only" });
+    const id = req.params.id;
+    const reason = req.body?.reason || "Rejected by admin";
+
+    // Prefer model static if available
+    if (typeof WastePost.rejectCompletion === "function") {
+      const updated = await WastePost.rejectCompletion(id, req.user._id, reason);
+      if (!updated) return res.status(404).json({ message: "Not found" });
+
+      // notifications
+      try {
+        if (updated.user) {
+          await Notification.create({
+            user: updated.user,
+            title: "Pickup rejected",
+            message: `Admin rejected completion for pickup ${updated._id}. Reason: ${reason}`,
+            type: "pickup_rejected",
+            meta: { wasteId: updated._id, reason },
+          });
+          emitToUser(updated.user, "notification", { title: "Pickup rejected", targetId: updated._id });
+        }
+        if (updated.collector) {
+          await Notification.create({
+            user: updated.collector,
+            title: "Pickup rejected",
+            message: `Admin rejected completion for pickup ${updated._id}. Reason: ${reason}`,
+            type: "pickup_rejected_collector",
+            meta: { wasteId: updated._id, reason },
+          });
+          emitToUser(updated.collector, "notification", { title: "Pickup rejected", targetId: updated._id });
+        }
+        emitToAdmins("pickup-rejected", { id: updated._id });
+      } catch (notifyErr) {
+        console.error("[notifications] rejectCompletion:", notifyErr && (notifyErr.stack || notifyErr.message));
+      }
+
+      return res.json({ data: updated });
+    }
+
+    // Fallback inline
+    const waste = await WastePost.findById(id);
+    if (!waste) return res.status(404).json({ message: "Not found" });
+
+    // Revert to 'Picked' (you can change to another fallback)
+    waste.status = "Picked";
+    pushHistory(waste, "Rejected", req.user._id, reason);
+    await waste.save();
+
+    // notifications
+    try {
+      if (waste.user) {
+        await Notification.create({
+          user: waste.user,
+          title: "Pickup rejected",
+          message: `Admin rejected completion for pickup ${waste._id}. Reason: ${reason}`,
+          type: "pickup_rejected",
+          meta: { wasteId: waste._id, reason },
+        });
+        emitToUser(waste.user, "notification", { title: "Pickup rejected", targetId: waste._id });
+      }
+      if (waste.collector) {
+        await Notification.create({
+          user: waste.collector,
+          title: "Pickup rejected",
+          message: `Admin rejected completion for pickup ${waste._id}. Reason: ${reason}`,
+          type: "pickup_rejected_collector",
+          meta: { wasteId: waste._id, reason },
+        });
+        emitToUser(waste.collector, "notification", { title: "Pickup rejected", targetId: waste._id });
+      }
+      emitToAdmins("pickup-rejected", { id: waste._id });
+    } catch (notifyErr) {
+      console.error("[notifications] rejectCompletion fallback:", notifyErr && (notifyErr.stack || notifyErr.message));
+    }
+
+    const populated = await WastePost.findById(waste._id).populate("user", "name email phone address").populate("collector", "name email");
+    return res.json({ data: populated });
+  } catch (err) {
+    console.error("rejectCompletion error", err && (err.stack || err.message || err));
+    return res.status(500).json({ message: "Server error" });
+  }
+};
+
+/* Optional admin endpoints (approve / reject) implemented above */

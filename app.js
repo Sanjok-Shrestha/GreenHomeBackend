@@ -1,8 +1,13 @@
+// app.js — main server bootstrap (updated to mount wasteSchedule and attach socket.io)
 require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const path = require("path");
+const fs = require("fs");
+const http = require("http");
+const { Server } = require("socket.io");
+const jwt = require("jsonwebtoken");
 
 // Helper: resolve-and-require; returns module or null
 function tryRequire(p) {
@@ -34,14 +39,10 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 /* ---------------------- CORS and parsers (MUST BE BEFORE ROUTE MOUNTS) ---------------------- */
-// Accept either a single origin, comma-separated list, or '*' via env.
-// Default set to local Vite dev server port 5173.
 let FRONTEND_ORIGIN = process.env.CORS_ORIGIN || process.env.FRONTEND_ORIGIN || "http://localhost:5173";
-// Normalize comma-separated string into array
 if (typeof FRONTEND_ORIGIN === "string" && FRONTEND_ORIGIN.includes(",")) {
   FRONTEND_ORIGIN = FRONTEND_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean);
 }
-
 console.log("Configured FRONTEND_ORIGIN =", FRONTEND_ORIGIN);
 
 const corsOptions = {
@@ -71,19 +72,11 @@ app.use((req, res, next) => {
 });
 
 app.use(cors(corsOptions));
-
-// Simple global OPTIONS responder
-app.use((req, res, next) => {
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
-
+app.use((req, res, next) => { if (req.method === "OPTIONS") return res.sendStatus(200); next(); });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 /* ---------------------- Disable caching for API responses ---------------------- */
-/* This prevents 304 Not Modified replies for API endpoints and ensures the client
-   receives fresh JSON during development. Keeps API responses no-store. */
 app.use("/api", (req, res, next) => {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
@@ -92,16 +85,10 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
-/* ---------------------- Uploads static handling (fix) ---------------------- */
-/* Purpose:
-   - Prevent malformed /api/api/uploads/... duplicates by normalizing requests early
-   - Serve the same uploads directory at both /uploads and /api/uploads so frontend
-     requests work whether they request '/uploads/..' or axios(baseURL:'/api') + '/uploads/...'
-   - Provide a debug route that logs missing files to help diagnose 404s
-*/
+/* ---------------------- Uploads static handling ---------------------- */
 const uploadsDir = path.join(__dirname, "uploads");
+try { fs.mkdirSync(uploadsDir, { recursive: true }); } catch (e) { /* ignore */ }
 
-// Normalize accidental duplicate prefix: /api/api/uploads -> /api/uploads
 app.use((req, res, next) => {
   if (typeof req.url === "string" && req.url.startsWith("/api/api/uploads")) {
     req.url = req.url.replace(/^\/api\/api\/uploads/, "/api/uploads");
@@ -109,43 +96,30 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve uploads publicly at both endpoints
 app.use("/uploads", express.static(uploadsDir));
 app.use("/api/uploads", express.static(uploadsDir));
-
-// Explicit handler that logs missing files (use RegExp route to avoid path-to-regexp parameter syntax issues)
 app.get(/^\/api\/uploads\/(.*)$/, (req, res) => {
-  // req.params[0] contains the captured "rest of path"
   const rel = (req.params && req.params[0]) ? req.params[0] : "";
-  const fs = require("fs");
   const fsPath = path.join(uploadsDir, rel);
-
   if (!fs.existsSync(fsPath)) {
     console.warn(`[uploads] file not found: ${fsPath} (requested ${req.originalUrl})`);
     return res.status(404).end();
   }
-
   res.sendFile(fsPath);
 });
 
-/* ---------------------- request logging (kept) ---------------------- */
+/* ---------------------- request logging ---------------------- */
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} Origin=${req.headers.origin || "-"}`);
   next();
 });
 
 /* ---------------------- Try to load optional models ---------------------- */
-const Pickup = tryRequireCandidates([
+const PickupModel = tryRequireCandidates([
   "./model/Pickup",
   "./models/Pickup",
   "./src/models/Pickup",
   "./src/models/pickup",
-]);
-
-const Report = tryRequireCandidates([
-  "./models/Report",
-  "./src/models/Report",
-  "./src/models/report",
 ]);
 
 /* ---------------------- Try to load optional routes ---------------------- */
@@ -165,17 +139,14 @@ let adminReportsRoutes = tryRequireCandidates(["./routes/adminReports", "./src/r
 let rewardCollectorRoutes = tryRequireCandidates(["./routes/wasteCollector", "./src/routes/wasteCollector", "./routes/collectorRedeem"]);
 let collectorAnalytics = tryRequireCandidates(["./routes/collectorAnalytics", "./src/routes/collectorAnalytics"]);
 let certificatesRoutes = tryRequireCandidates(["./routes/certificates", "./routes/certificates"]);
-let pricingRoutes = tryRequireCandidates(["./routes/pricing", "./src/routes/pricing"]);
-
-// wasteCategories (GET /api/waste/categories)
+let pricingRoutes = tryRequireCandidates(["./routes/pricing", "./routes/pricing"]);
 let wasteCategoriesRoutes = tryRequireCandidates(["./routes/wasteCategories", "./src/routes/wasteCategories"]);
-
-// adminCategories (DB-backed CRUD at /api/admin/categories)
 let adminCategoriesRoutes = tryRequireCandidates(["./routes/adminCategories", "./src/routes/adminCategories"]);
 
-console.log("DEBUG: adminUsersRoutes found:", !!adminUsersRoutes);
+// NEW: try to load wasteSchedule router (the schedule/cancel endpoints)
+let wasteScheduleRoutes = tryRequireCandidates(["./routes/wasteSchedule", "./src/routes/wasteSchedule"]);
 
-/* ---------------------- Mount routes (guarded) ---------------------- */
+/* ---------------------- Mount helper ---------------------- */
 function mountRoute(prefix, mod, name) {
   if (!mod) {
     console.warn(`${name} not mounted (module not found).`);
@@ -189,22 +160,22 @@ function mountRoute(prefix, mod, name) {
   }
 }
 
-// Health & root
+/* ---------------------- Health & root endpoints ---------------------- */
 app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get("/", (req, res) => res.send("GreenHome Backend Running"));
 app.get("/api/admin/__ping", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+/* ---------------------- Mount primary routes ---------------------- */
 if (earningsRoutes) {
   mountRoute("/api/waste", earningsRoutes, "earningsRoutes");
 } else {
   mountRoute("/api/waste", wasteRoutes || rewardCollectorRoutes, "wasteRoutes / wasteCollector");
 }
 
-// mount wasteCategories
+// wasteCategories
 mountRoute("/api/waste", wasteCategoriesRoutes, "wasteCategoriesRoutes");
 
-// --- ALIAS: mount the same waste router at /api/posts so clients requesting /api/posts/* succeed ---
-// This creates /api/posts/recent as an alias to the waste router if the waste router exists.
+// alias /api/posts
 try {
   const aliasModule = earningsRoutes || wasteRoutes || rewardCollectorRoutes;
   if (aliasModule) {
@@ -227,7 +198,7 @@ mountRoute("/api/dashboard", dashboardRoutes, "dashboardRoutes");
 mountRoute("/api/collector", collectorRoutes, "collectorRoutes");
 mountRoute("/api/collector", collectorAnalytics, "collectorAnalytics (mounted at same prefix)");
 
-// rewards (complex fallback handling)
+// rewards mounting (keep fallback behavior)
 if (rewardsRoutes) {
   mountRoute("/api", rewardsRoutes, "rewardsRoutes (mounted at /api)");
 } else {
@@ -247,7 +218,13 @@ if (rewardsRoutes) {
   }
 }
 
-mountRoute("/api/notifications", notificationRoutes, "notificationRoutes");
+// Prefer combined notifications router if present, otherwise fall back to discovered notificationRoutes
+try {
+  const combinedNotifications = require(path.join(__dirname, "routes", "notifications"));
+  mountRoute("/api/notifications", combinedNotifications, "notifications (combined)");
+} catch (e) {
+  mountRoute("/api/notifications", notificationRoutes, "notificationRoutes (fallback)");
+}
 
 // admin mounts
 if (adminCollectorsRouter) mountRoute("/api/admin", adminCollectorsRouter, "adminCollectors");
@@ -267,24 +244,39 @@ if (adminRedemptionsRoutes) mountRoute("/api/admin", adminRedemptionsRoutes, "ad
 if (adminOverviewRoutes) mountRoute("/api/admin", adminOverviewRoutes, "adminOverview");
 if (adminReportsRoutes) mountRoute("/api/admin", adminReportsRoutes, "adminReports");
 
-// mount adminCategories (DB-backed) if available
+// mount adminCategories (DB-backed) if available; also mount fallback path at /api/admin/categories
 if (adminCategoriesRoutes) {
   mountRoute("/api/admin", adminCategoriesRoutes, "adminCategoriesRoutes");
+  try { app.use("/api/admin/categories", adminCategoriesRoutes); console.log("Also mounted adminCategoriesRoutes at /api/admin/categories"); } catch (e) {}
 } else {
   try {
     const directAdminCats = require(path.join(__dirname, "routes", "adminCategories"));
     mountRoute("/api/admin", directAdminCats, "adminCategories (direct)");
-    adminCategoriesRoutes = directAdminCats;
+    app.use("/api/admin/categories", directAdminCats);
   } catch (e) {
     console.warn("adminCategories route not found via loader or direct require. A temporary in-memory handler may be used later.");
   }
 }
 
-if (certificatesRoutes) mountRoute("/api", certificatesRoutes, "certificatesRoutes");
+/* ---------------------- NEW: mount wasteScheduleRoutes so schedule endpoints exist ---------------------- */
+// This mounts the schedule router at /api/waste; its routes are relative, e.g. /:id/schedule maps to /api/waste/:id/schedule
+if (wasteScheduleRoutes) {
+  mountRoute("/api/waste", wasteScheduleRoutes, "wasteScheduleRoutes");
+} else {
+  try {
+    const wsDirect = require(path.join(__dirname, "routes", "wasteSchedule"));
+    mountRoute("/api/waste", wsDirect, "wasteSchedule (direct)");
+  } catch (e) {
+    console.warn("wasteSchedule router not found; scheduling endpoints will not exist until routes/wasteSchedule.js is added.");
+  }
+}
 
-/* ---------------------- DEBUG: route list endpoint + explicit fallback mount ---------------------- */
+/* mount certificates if present (some routers define /certificates internally) */
+if (certificatesRoutes) {
+  mountRoute("/api", certificatesRoutes, "certificatesRoutes");
+}
 
-// Expose a JSON list of routes for debugging
+/* ---------------------- DEBUG: route list endpoint ---------------------- */
 app.get("/__debug/routes", (req, res) => {
   const out = [];
   const stack = app._router?.stack || [];
@@ -303,20 +295,7 @@ app.get("/__debug/routes", (req, res) => {
   res.json(out);
 });
 
-// Fallback: also mount adminCategoriesRoutes at /api/admin/categories if present
-try {
-  if (adminCategoriesRoutes) {
-    app.use("/api/admin/categories", adminCategoriesRoutes);
-    console.log("Fallback: also mounted adminCategoriesRoutes at /api/admin/categories");
-  }
-} catch (e) {
-  console.warn("Failed to mount adminCategoriesRoutes at /api/admin/categories:", e && e.message ? e.message : e);
-}
-
 /* ---------------------- Temporary in-memory admin CRUD (dev only) ---------------------- */
-/* This provides GET/POST/PATCH/DELETE at /api/admin/categories while a DB-backed router is absent.
-   It's intentionally simple and stores data in memory only (lost on server restart). */
-
 (() => {
   // If a DB-backed adminCategoriesRoutes is mounted, skip the temp router.
   if (adminCategoriesRoutes) {
@@ -330,7 +309,6 @@ try {
   let memo = []; // in-memory store: { _id, name, description, active }
   let nextId = 1;
 
-  // Try to seed from /api/waste/categories if available
   async function seedFromWaste() {
     try {
       const host = process.env.INTERNAL_API_HOST || `http://localhost:${process.env.PORT || 5000}`;
@@ -380,8 +358,7 @@ try {
     const { id } = req.params;
     const idx = memo.findIndex((c) => String(c._id) === String(id));
     if (idx === -1) return res.status(404).json({ message: "Not found" });
-    const updates = req.body || {};
-    memo[idx] = { ...memo[idx], ...updates };
+    memo[idx] = { ...memo[idx], ...(req.body || {}) };
     return res.json(memo[idx]);
   });
 
@@ -401,7 +378,7 @@ try {
 let errorHandler;
 try {
   const mod = tryRequireCandidates(["./middleware/errorHandler", "./src/middleware/errorHandler"]);
-  errorHandler = mod && mod.errorHandler ? mod.errorHandler : null;
+  errorHandler = mod && (typeof mod === "function" ? mod : mod.errorHandler ? mod.errorHandler : null);
   if (errorHandler) {
     app.use(errorHandler);
     console.log("Loaded external errorHandler middleware.");
@@ -455,7 +432,7 @@ function listRoutes() {
   console.log("Registered routes:\n", routes.join("\n") || "(none)");
 }
 
-/* ---------------------- Connect DB & Start server ---------------------- */
+/* ---------------------- Connect DB & Start HTTP + Socket server ---------------------- */
 (async () => {
   try {
     const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
@@ -477,8 +454,102 @@ function listRoutes() {
     // Print route map for debugging
     listRoutes();
 
-    app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
+    // Create HTTP server and attach socket.io
+    const server = http.createServer(app);
+
+    const io = new Server(server, {
+      cors: {
+        origin: FRONTEND_ORIGIN,
+        credentials: true,
+      },
+      maxHttpBufferSize: 1e6,
+    });
+
+    // expose globally for controllers that may emit events
+    global.io = io;
+
+    // Try to resolve WastePost model (use loader used earlier)
+    const WastePost = tryRequireCandidates([
+      "./models/WastePost",
+      "./model/WastePost",
+      "./src/models/WastePost",
+      "./server/models/WastePost",
+    ]) || null;
+
+    const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+
+    // Socket auth middleware: parse Bearer token from handshake.auth.token or Authorization header
+    io.use((socket, next) => {
+      try {
+        const token =
+          socket.handshake?.auth?.token ||
+          (socket.handshake?.headers?.authorization || "").replace(/^Bearer\s+/i, "");
+        if (!token) {
+          socket.userId = null;
+          return next();
+        }
+        const payload = jwt.verify(token, JWT_SECRET);
+        socket.userId = payload.id || payload._id || payload.userId || null;
+        return next();
+      } catch (err) {
+        // invalid token -> mark as anonymous (or reject with next(err) to enforce)
+        socket.userId = null;
+        return next();
+      }
+    });
+
+    io.on("connection", (socket) => {
+      // join/leave rooms for specific pickups
+      socket.on("join-waste-room", (wasteId) => {
+        if (typeof wasteId !== "string") return;
+        socket.join(`waste:${wasteId}`);
+      });
+
+      socket.on("leave-waste-room", (wasteId) => {
+        if (typeof wasteId !== "string") return;
+        socket.leave(`waste:${wasteId}`);
+      });
+
+      // collector sends live location update
+      socket.on("collector-location", async (payload = {}) => {
+        try {
+          const { wasteId, lat, lng } = payload || {};
+          if (!wasteId || typeof lat !== "number" || typeof lng !== "number") return;
+          // must be authenticated collector
+          const uid = socket.userId;
+          if (!uid) return;
+
+          if (!WastePost) return;
+          const waste = await WastePost.findById(wasteId).select("collector shareLocation");
+          if (!waste) return;
+          if (!waste.collector || String(waste.collector) !== String(uid)) return;
+
+          // Optionally respect shareLocation flag; if you want to require it uncomment:
+          // if (!waste.shareLocation) return;
+
+          // update last known collector location
+          waste.collectorLocation = { lat, lng, updatedAt: new Date() };
+          await waste.save();
+
+          // emit to room
+          io.to(`waste:${wasteId}`).emit("collector-location", {
+            wasteId,
+            lat,
+            lng,
+            updatedAt: waste.collectorLocation.updatedAt,
+          });
+        } catch (err) {
+          console.error("socket collector-location error:", err && (err.stack || err.message));
+        }
+      });
+
+      socket.on("disconnect", () => {
+        // optional cleanup
+      });
+    });
+
+    server.listen(PORT, () => {
+      console.log(`HTTP+Socket server listening on http://localhost:${PORT}`);
     });
   } catch (err) {
     console.error("DB connection error / server not started:", err && (err.stack || err.message || err));
