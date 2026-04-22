@@ -176,13 +176,13 @@ exports.list = async (req, res) => {
     summary.totalUsers = Number.isFinite(Number(uCount)) ? uCount : null;
     summary.totalPosts = Number.isFinite(Number(pCount)) ? pCount : (rows.length ? rows.length : 0);
     summary.totalPickups = Number.isFinite(Number(pickupCount)) ? pickupCount : rows.length;
-    summary.totalEarnings = Number.isFinite(Number(paymentTotal)) ? paymentTotal : rows.reduce((s, r) => s + (r.price || 0), 0);
+    summary.totalpoints = Number.isFinite(Number(paymentTotal)) ? paymentTotal : rows.reduce((s, r) => s + (r.price || 0), 0);
 
     // ensure numbers are numbers (no nulls if possible)
     summary.totalUsers = summary.totalUsers ?? 0;
     summary.totalPosts = summary.totalPosts ?? 0;
     summary.totalPickups = summary.totalPickups ?? 0;
-    summary.totalEarnings = summary.totalEarnings ?? 0;
+    summary.totalpoints = summary.totalpoints ?? 0;
 
     console.log(`adminReportsController.list: returning ${rows.length} rows (limit=${limit}) summary: users=${summary.totalUsers} posts=${summary.totalPosts} pickups=${summary.totalPickups} earnings=${summary.totalEarnings}`);
 

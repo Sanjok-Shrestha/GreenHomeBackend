@@ -104,7 +104,6 @@ router.get("/recent", async (req, res) => {
     const type = req.query.type ? String(req.query.type).toLowerCase() : null;
     const q = req.query.q ? String(req.query.q).toLowerCase() : null;
 
-    // Attempt to load a DB model gracefully (common candidate paths)
     function tryLoadModel(candidates = []) {
       for (const p of candidates) {
         try {
@@ -112,9 +111,7 @@ router.get("/recent", async (req, res) => {
           const mod = require(resolved);
           if (mod && (typeof mod.find === "function" || typeof mod.countDocuments === "function")) return mod;
           if (mod && mod.default && (typeof mod.default.find === "function")) return mod.default;
-        } catch (e) {
-          // ignore
-        }
+        } catch (e) {}
       }
       return null;
     }
@@ -145,13 +142,13 @@ router.get("/recent", async (req, res) => {
       return res.json({ posts: items, page, perPage, total });
     }
 
-    // No DB -> fallback to in-memory sample
     let items = SAMPLE.slice();
     if (type) items = items.filter((p) => (p.wasteType || "").toLowerCase() === type);
-    if (q) items = items.filter((p) => {
-      const hay = `${p.description || ""} ${p.wasteType || ""} ${p.location || ""}`.toLowerCase();
-      return hay.includes(q);
-    });
+    if (q)
+      items = items.filter((p) => {
+        const hay = `${p.description || ""} ${p.wasteType || ""} ${p.location || ""}`.toLowerCase();
+        return hay.includes(q);
+      });
 
     const total = items.length;
     const start = (page - 1) * perPage;
@@ -162,10 +159,6 @@ router.get("/recent", async (req, res) => {
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-
-/* -------------------------
-   Application routes (DB-backed handlers)
-   ------------------------- */
 
 // Create waste post (accepts optional image field named "image")
 router.post("/post", protect, authorize("user"), upload.single("image"), createWastePost);
@@ -180,12 +173,7 @@ router.get("/track/:id", protect, authorize("user", "collector", "admin"), track
 // Get current user's posts
 router.get("/my-posts", protect, authorize("user"), getUserWastePosts);
 
-/* -------------------------
-   Admin routes for pending approvals
-   - GET  /waste/admin/pending-approvals
-   - POST /waste/:id/approve
-   - POST /waste/:id/reject
-   ------------------------- */
+// Admin routes for pending approvals
 router.get("/admin/pending-approvals", protect, authorize("admin"), getPendingApprovals);
 router.post("/:id/approve", protect, authorize("admin"), approveCompletion);
 router.post("/:id/reject", protect, authorize("admin"), rejectCompletion);
@@ -201,8 +189,8 @@ router.post("/complete/:id", protect, authorize("collector", "admin"), markAsCol
 // Get available (unassigned) pickups
 router.get("/available", protect, authorize("collector", "admin"), getAvailablePickups);
 
-// Assign pickup to authenticated collector (atomic)
-router.post("/:id/assign", protect, authorize("collector"), assignPickup);
+// Assign pickup (collector OR admin)
+router.post("/:id/assign", protect, authorize("collector", "admin"), assignPickup);
 
 // Status updates (collector/admin) with several shapes supported
 router.patch("/:id/status", protect, authorize("collector", "admin"), updateStatus);

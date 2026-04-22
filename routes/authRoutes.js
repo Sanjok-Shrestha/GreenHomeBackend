@@ -1,12 +1,11 @@
+// backend/routes/auth.js
 const express = require("express");
 const router = express.Router();
-const { register, login, me } = require("../controllers/authController");
+const authCtrl = require("../controllers/authController");
 const { protect } = require("../middleware/authMiddleware");
 
-router.post("/register", register);
-router.post("/login", login);
-
-// Return current authenticated user (token required)
-router.get("/me", protect, me);
+router.post("/register", authCtrl.register);
+router.post("/login", authCtrl.login);
+router.get("/me", protect, authCtrl.me);
 
 module.exports = router;

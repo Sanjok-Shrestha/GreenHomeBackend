@@ -1,12 +1,4 @@
 // controllers/collectorController.js
-/**
- * Collector controller (points-based analytics)
- * - Uses WastePost model (falls back to Pickup if needed)
- * - Sums Payment.amount as "points" (falls back to user.points when available)
- * - Regex-status matching (case-insensitive)
- * - Pagination + meta for history
- */
-
 const mongoose = require("mongoose");
 
 // Prefer WastePost model (your schema). Fall back to Pickup if present.
@@ -38,6 +30,69 @@ function toObjectIdIfValid(id) {
     try { return new mongoose.Types.ObjectId(String(id)); } catch { return String(id); }
   }
   return String(id);
+}
+
+// Normalize helpers (tolerant to string/object/flatted)
+function n(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s === "" ? null : s;
+}
+function normalizePhone(u) {
+  if (!u) return null;
+  const p = u.phone ?? u.mobile ?? u.phoneNumber ?? (u.contact && u.contact.phone) ?? null;
+  if (!p) return null;
+  const digits = String(p).replace(/\D/g, "");
+  return digits === "" ? null : digits;
+}
+function normalizeAddress(u) {
+  if (!u) return null;
+  const a = u.address;
+  // object address
+  if (a && typeof a === "object") {
+    const have = a.line1 || a.line2 || a.city || a.state || a.postalCode || a.country;
+    if (have) {
+      return {
+        line1: n(a.line1),
+        line2: n(a.line2),
+        city: n(a.city),
+        state: n(a.state),
+        postalCode: n(a.postalCode),
+        country: n(a.country),
+      };
+    }
+  }
+  // string address
+  if (a && typeof a === "string") {
+    const s = n(a);
+    if (s) return { line1: s, line2: null, city: null, state: null, postalCode: null, country: null };
+  }
+  // flattened fields
+  const line1 = n(u.addressLine1 ?? u.address1 ?? u.addressString ?? null);
+  const line2 = n(u.addressLine2 ?? u.address2 ?? null);
+  const city = n(u.city ?? null);
+  const state = n(u.state ?? null);
+  const postalCode = n(u.postalCode ?? u.postcode ?? u.zip ?? null);
+  const country = n(u.country ?? null);
+  const any = line1 || line2 || city || state || postalCode || country;
+  if (!any) return null;
+  return { line1, line2, city, state, postalCode, country };
+}
+
+// Apply normalization to populated user object (mutates in-place)
+function normalizeUserForResponse(user) {
+  if (!user) return user;
+  try {
+    user.phone = normalizePhone(user);
+  } catch (e) {
+    user.phone = user.phone ?? null;
+  }
+  try {
+    user.address = normalizeAddress(user);
+  } catch (e) {
+    user.address = user.address ?? null;
+  }
+  return user;
 }
 
 // Ensure indexes (best-effort)
@@ -158,6 +213,11 @@ async function getCollectorHistory(req, res) {
       Pickup.countDocuments(match),
     ]);
 
+    // normalize populated user shape for client
+    items.forEach((p) => {
+      if (p.user) normalizeUserForResponse(p.user);
+    });
+
     res.json({ data: items, meta: { page, limit, total } });
   } catch (err) {
     console.error("getCollectorHistory error", err && (err.stack || err.message || err));
@@ -184,6 +244,10 @@ async function getCollectorHistoryById(req, res) {
       .lean();
 
     if (!pickup) return res.status(404).json({ message: "Pickup not found" });
+
+    // Normalize populated users
+    if (pickup.user) normalizeUserForResponse(pickup.user);
+    if (pickup.collector) normalizeUserForResponse(pickup.collector);
 
     const collectorId = toObjectIdIfValid(collectorIdRaw);
     const isCollector = String(pickup.collector?._id ?? pickup.collector) === String(collectorId);
@@ -225,7 +289,7 @@ async function getCollectorAnalytics(req, res) {
     const completedDocs = await Pickup.find({
       ...kpiMatch,
       status: { $in: [/^collected$/i, /^completed$/i] },
-    }).select("price quantity completedAt");
+    }).select("price quantity completedAt").lean();
 
     const completedMonth = completedDocs.length;
 
@@ -245,11 +309,9 @@ async function getCollectorAnalytics(req, res) {
         { $sort: { _id: 1 } },
       ]);
 
-      // map into dateMap
       const dateMap = {};
       paymentAgg.forEach((r) => { dateMap[r._id] = { date: r._id, points: r.points, pickups: 0, kg: 0 }; totalPoints += Number(r.points || 0); });
 
-      // Fill pickups/kg per day from Pickup completed docs
       const pickupsAgg = await Pickup.aggregate([
         { $match: { collector: collectorId, status: { $in: [/^collected$/i, /^completed$/i] }, completedAt: { $gte: since } } },
         { $project: { day: { $dateToString: { format: "%Y-%m-%d", date: "$completedAt" } }, qty: { $ifNull: ["$quantity", 0] } } },
@@ -261,7 +323,6 @@ async function getCollectorAnalytics(req, res) {
         else { dateMap[p._id].pickups = p.pickups; dateMap[p._id].kg = p.kg; }
       });
 
-      // build full series for 'days' window
       for (let i = 0; i < days; i++) {
         const d = new Date(since);
         d.setDate(since.getDate() + i);
@@ -270,7 +331,6 @@ async function getCollectorAnalytics(req, res) {
         series.push({ date: entry.date, pickups: entry.pickups, kg: entry.kg, points: entry.points });
       }
     } else {
-      // fallback: compute series from completed pickups and approximate points via env POINTS_PER_PICKUP_COLLECTOR
       const POINTS_PER_PICKUP = Number(process.env.POINTS_PER_PICKUP_COLLECTOR ?? 10);
       const pickupsAgg = await Pickup.aggregate([
         { $match: { collector: collectorId, status: { $in: [/^collected$/i, /^completed$/i] }, completedAt: { $gte: since } } },
@@ -289,12 +349,10 @@ async function getCollectorAnalytics(req, res) {
       }
     }
 
-    // status counts
     const statusCountsAgg = await Pickup.aggregate([{ $match: kpiMatch }, { $group: { _id: "$status", count: { $sum: 1 } } }]);
     const statusCounts = {};
     (statusCountsAgg || []).forEach((r) => { statusCounts[r._id || "unknown"] = r.count; });
 
-    // top zones by kg
     const topZonesAgg = await Pickup.aggregate([
       { $match: kpiMatch },
       { $group: { _id: "$location", pickups: { $sum: 1 }, kg: { $sum: { $ifNull: ["$quantity", 0] } } } },
@@ -303,7 +361,6 @@ async function getCollectorAnalytics(req, res) {
     ]);
     const topZones = topZonesAgg.map((t) => ({ zone: t._id || "Unknown", pickups: t.pickups, kg: t.kg }));
 
-    // avg pickup completion time minutes
     let avgPickupTimeMinutes = null;
     try {
       const timesAgg = await Pickup.aggregate([
@@ -316,7 +373,6 @@ async function getCollectorAnalytics(req, res) {
       avgPickupTimeMinutes = null;
     }
 
-    // read current points from user if available
     let currentUserPoints = null;
     try {
       if (User) {
